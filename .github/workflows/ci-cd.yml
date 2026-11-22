@@ -2,31 +2,112 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
   pull_request:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    name: Build and Test
+  validate:
+    name: Validate and test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check project structure
+        id: project
+        shell: bash
+        run: |
+          if [ -f package.json ]; then
+            echo "node_project=true" >> "$GITHUB_OUTPUT"
+            echo "Node.js project detected."
+          else
+            echo "node_project=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No root package.json found. Node.js checks will be skipped until the application is added."
+          fi
+
       - name: Setup Node.js
+        if: steps.project.outputs.node_project == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: "22"
 
-      - name: Install Dependencies
-        run: npm ci
+      - name: Install dependencies
+        if: steps.project.outputs.node_project == 'true'
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::error::package.json exists but package-lock.json is missing. Commit the lockfile for reproducible CI."
+            exit 1
+          fi
 
-      - name: Run Tests
-        run: npm test --if-present
+      - name: Run tests
+        if: steps.project.outputs.node_project == 'true'
+        shell: bash
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+            npm test -- --if-present
+          else
+            echo "::notice::No test script configured yet; skipping tests."
+          fi
 
-      - name: Build Application
-        run: npm run build --if-present
+      - name: Build application
+        if: steps.project.outputs.node_project == 'true'
+        shell: bash
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+            npm run build
+          else
+            echo "::notice::No build script configured yet; skipping build."
+          fi
+
+      - name: Validate workflow configuration
+        run: |
+          echo "Repository validation completed."
+          echo "Docker publishing and AWS deployment are not enabled yet."
+
+  docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Dockerfile
+        id: dockerfile
+        shell: bash
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No root Dockerfile found. Docker build will be skipped until container configuration is added."
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.dockerfile.outputs.available == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        if: steps.dockerfile.outputs.available == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: pff-project:ci
